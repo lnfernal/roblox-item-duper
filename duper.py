@@ -129,7 +129,6 @@ if __name__ == "__main__":
 
         csrf_token = re.search("data-token=\"?([\w/+]+)\"?", resp.text).group(1)
         product_id = re.search("data-product-id=\"?(\d+)\"?", resp.text).group(1)
-        seller_id = re.search("data-expected-seller-id=\"?(\d+)\"?", resp.text).group(1)
         del resp
         del session
 
